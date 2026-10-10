@@ -27,7 +27,39 @@ streamlit run app.py
 
 All credentials live in `.streamlit/secrets.toml` (gitignored). See `.streamlit/secrets.toml.example` for the schema. Required keys: `sheet_id`, `worksheet_name`, `[gcp_service_account]`. Optional: `HF_API_TOKEN` for AI summaries.
 
-The Google service account needs read access to the target sheet — share the sheet with the service account's `client_email`.
+The Google service account needs Editor access to the target sheet — share the
+sheet with the service account's `client_email`. The app reads the original
+form responses and appends approved reviews to this same worksheet.
+
+## Student reviews and approvals
+
+The **Submit Review** tab saves submissions as `Pending` to a local SQLite
+database. Only approved reviews appear in **Student Reviews**. No Google Sheets
+permissions or email service are used to store pending reviews; approval
+appends a corresponding row to the existing course-response worksheet so the
+dashboard's visualizations use it.
+
+Approved reviews are written only to the existing form-response columns:
+course, optional `Course Name` (when `Other` is selected), assignment and
+assessment types, professor, semester, difficulty, usefulness, liked, and
+comments. No columns are added or changed. The Google service account therefore
+needs **Editor** access to the source spreadsheet.
+
+Set `review_admin_emails` in Streamlit secrets to the exact Google account
+addresses allowed to approve reviews. Admins sign in with Google using
+`[auth]` for shared settings and `[auth.google]` for the Google provider
+credentials; the approval tab is shown only to allowlisted accounts. General
+dashboard sign-in remains controlled separately by `enable_auth`.
+
+Install the dependencies from `requirements.txt` so Streamlit's `auth` extra
+and Authlib are available for Google sign-in.
+
+The database defaults to `reviews.sqlite3` beside `app.py`; set
+`review_database_path` to use a different writable path. The database file is
+ignored by Git. A local SQLite file is suitable for a single persistent app
+server, but Streamlit Community Cloud does not guarantee local-file persistence
+across restarts or redeployments. Use a host with a persistent disk or back up
+the database if reviews must survive those events.
 
 ## AI summary reuse
 

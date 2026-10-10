@@ -2,16 +2,28 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import gspread
+from google.auth.exceptions import GoogleAuthError
 from google.oauth2.service_account import Credentials
 import plotly.express as px
 import plotly.graph_objects as go
+from requests.exceptions import RequestException
 from collections import Counter
 import re
 import hashlib
 import logging
+import sqlite3
+import uuid
 from datetime import datetime
 from difflib import SequenceMatcher
+from pathlib import Path
 from summary_cache import get_cached_response
+from review_workflow import (
+    add_pending_review,
+    append_approved_review_to_worksheet,
+    get_reviews,
+    set_review_status,
+    validate_review,
+)
 
 st.set_page_config(
     page_title="DSI Course Decision Dashboard",
@@ -421,7 +433,7 @@ def build_prof_display_map(prof_series: pd.Series) -> dict:
 def load_data(sheet_id: str, worksheet_name: str) -> pd.DataFrame:
     creds_dict = st.secrets["gcp_service_account"]
     scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive.readonly",
     ]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
@@ -1125,15 +1137,7 @@ if df.empty:
 
 # ========== SIDEBAR ==========
 st.sidebar.image("assets/dsi_council_logo.png", use_container_width=True)
-st.sidebar.markdown(
-    "<div style='text-align:center; margin-top:-6px; margin-bottom:14px;'>"
-    "<a href='https://docs.google.com/forms/d/e/1FAIpQLScfC3rpdgzNHFrP0D287wZ1N704PdnRB84mr_mqnxiqzkMhJA/viewform' "
-    "target='_blank' rel='noopener' "
-    "style='display:inline-block; background:#012169; color:#fff; padding:7px 14px; "
-    "border-radius:6px; text-decoration:none; font-weight:600; font-size:0.85rem;'>"
-    "📝 Submit an Evaluation</a></div>",
-    unsafe_allow_html=True,
-)
+st.sidebar.caption("Use the Submit Review tab to share a course review.")
 st.sidebar.divider()
 st.sidebar.header("Filters")
 
@@ -1220,9 +1224,279 @@ if component_filter and "_components" in filtered.columns and COURSE_COL in filt
 st.title("Course Decision Dashboard")
 st.caption("Built from student responses (auto-refreshes). Use filters in the sidebar.")
 
-tab_overview, tab_deep, tab_compare = st.tabs(
-    ["📊 Overview (Rankings)", "🔍 Course Deep Dive", "⚖️ Compare Courses"]
+configured_admins = st.secrets.get("review_admin_emails", [])
+if isinstance(configured_admins, str):
+    configured_admins = [configured_admins]
+admin_emails = {
+    str(email).strip().lower()
+    for email in configured_admins
+    if str(email).strip()
+}
+user_is_logged_in = bool(getattr(st.user, "is_logged_in", False))
+signed_in_email = (getattr(st.user, "email", "") or "").strip().lower()
+is_review_admin = user_is_logged_in and signed_in_email in admin_emails
+
+if is_review_admin:
+    with st.sidebar:
+        st.divider()
+        st.caption(f"Review admin: {signed_in_email}")
+        if st.button("Admin logout", key="review_admin_logout"):
+            st.logout()
+            st.rerun()
+elif admin_emails and not user_is_logged_in:
+    with st.sidebar:
+        st.divider()
+        if st.button("Admin sign in", key="review_admin_login"):
+            if hasattr(st, "login"):
+                st.login("google")
+            else:
+                st.error("Admin sign-in requires Streamlit 1.42 or later.")
+elif admin_emails and user_is_logged_in and not is_review_admin and not st.secrets.get("enable_auth", False):
+    with st.sidebar:
+        st.divider()
+        st.caption("The signed-in account cannot approve reviews.")
+        if st.button("Sign out to switch accounts", key="review_admin_signout"):
+            st.logout()
+            st.rerun()
+
+review_database_path = st.secrets.get(
+    "review_database_path",
+    str(Path(__file__).resolve().parent / "reviews.sqlite3"),
 )
+
+tab_labels = [
+    "📊 Overview (Rankings)",
+    "🔍 Course Deep Dive",
+    "⚖️ Compare Courses",
+    "📝 Submit Review",
+    "⭐ Student Reviews",
+]
+if is_review_admin:
+    tab_labels.append("🔐 Admin Approvals")
+tabs = st.tabs(tab_labels)
+tab_overview, tab_deep, tab_compare, tab_submit, tab_reviews = tabs[:5]
+tab_admin = tabs[5] if is_review_admin else None
+
+def _render_student_review(review: dict) -> None:
+    with st.container(border=True):
+        course = review.get("course_name") if review.get("course", "").casefold() == "other" else review.get("course", "")
+        st.text(
+            f"{course} · {review.get('instructor', '')} "
+            f"· {review.get('term', '')} {review.get('year', '')}"
+        )
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Difficulty", f"{review.get('difficulty_rating') or '—'}/10")
+        c2.metric("Usefulness", f"{review.get('usefulness_rating') or '—'}/10")
+        liked = review.get("liked")
+        c3.metric("Liked", "Yes" if liked is True or liked == 1 else ("No" if liked is False or liked == 0 else "—"))
+        st.caption(f"Assignments / assessments: {review.get('assignments', '')}")
+        st.text(review.get("review", ""))
+
+
+def _append_approved_review_to_source_sheet(review: dict) -> bool:
+    credentials = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    client = gspread.authorize(credentials)
+    worksheet = client.open_by_key(st.secrets["sheet_id"]).worksheet(
+        st.secrets["worksheet_name"]
+    )
+    return append_approved_review_to_worksheet(
+        worksheet,
+        review,
+        {
+            "timestamp": TS_COL,
+            "course": COURSE_COL,
+            "course_name": COURSE_NAME_COL,
+            "assignments": ASSIGN_COL,
+            "instructor": PROF_COL,
+            "semester": SEM_COL,
+            "difficulty": DIFF_COL,
+            "usefulness": USE_COL,
+            "liked": LIKED_COL,
+            "comments": COMMENTS_COL,
+        },
+    )
+
+
+with tab_submit:
+    st.subheader("Submit a course review")
+    st.caption(
+        "Your review is saved for administrator approval. Once approved, it is added "
+        "to the Google Sheet and appears in the dashboard."
+    )
+    course_options = sorted(df[COURSE_COL].dropna().astype(str).str.strip().unique().tolist())
+    if not any(course.casefold() == "other" for course in course_options):
+        course_options.append("Other")
+    if not course_options:
+        st.info("No courses are currently available for review.")
+    else:
+        with st.form("submit_course_review"):
+            review_course = st.selectbox("Course", course_options)
+            course_name = st.text_input(
+                "Course name (required if you selected Other)",
+                max_chars=200,
+            )
+            assignments = st.text_area(
+                "What types of assignments / assessments did the class consist of?",
+                max_chars=1000,
+                height=100,
+                help="For example: problem sets, projects, midterm, final exam, or presentations.",
+            )
+            instructor = st.text_input("Instructor name", max_chars=120)
+            term_col, year_col = st.columns(2)
+            with term_col:
+                review_term = st.selectbox("Course duration", ["Fall", "Spring"])
+            with year_col:
+                review_year = st.selectbox(
+                    "Year",
+                    list(range(datetime.now().year + 1, 1999, -1)),
+                    index=1 if datetime.now().year + 1 > 2000 else 0,
+                )
+            rating_col1, rating_col2 = st.columns(2)
+            with rating_col1:
+                difficulty_rating = st.slider(
+                    "Course difficulty (10 = very difficult)",
+                    1,
+                    10,
+                    5,
+                )
+                usefulness_rating = st.slider(
+                    "Course material usefulness (10 = very useful)",
+                    1,
+                    10,
+                    5,
+                )
+            with rating_col2:
+                liked_answer = st.selectbox("Did you like this class?", ["Yes", "No"])
+            review_text = st.text_area(
+                "Write your review",
+                max_chars=3000,
+                height=180,
+                help="Do not include personal or confidential information.",
+            )
+            submitted = st.form_submit_button("Submit for approval", type="primary")
+
+        if submitted:
+            try:
+                cleaned_review = validate_review(
+                    {
+                        "course": review_course,
+                        "course_name": course_name,
+                        "assignments": assignments,
+                        "instructor": instructor,
+                        "term": review_term,
+                        "year": review_year,
+                        "difficulty_rating": difficulty_rating,
+                        "usefulness_rating": usefulness_rating,
+                        "liked": liked_answer == "Yes",
+                        "review": review_text,
+                    }
+                )
+                review_record = {
+                    **cleaned_review,
+                    "review_id": uuid.uuid4().hex,
+                    "submitted_at": datetime.now().astimezone().isoformat(timespec="microseconds"),
+                }
+                add_pending_review(
+                    review_database_path,
+                    review_record["review_id"],
+                    review_record["submitted_at"],
+                    cleaned_review,
+                )
+                st.success("Review submitted for approval.")
+            except ValueError as exc:
+                st.error(str(exc))
+            except (OSError, sqlite3.Error) as exc:
+                st.error(f"Could not save the review: {exc}")
+
+
+with tab_reviews:
+    st.subheader("Approved student reviews")
+    try:
+        approved_reviews = get_reviews(review_database_path, status="Approved")
+    except sqlite3.Error as exc:
+        st.error(f"Could not load approved reviews: {exc}")
+    else:
+        if not approved_reviews:
+            st.info("There are no approved reviews yet.")
+        else:
+            for approved_review in approved_reviews:
+                _render_student_review(approved_review)
+
+
+if tab_admin is not None:
+    with tab_admin:
+        st.subheader("Review approval portal")
+        st.caption(f"Signed in as {signed_in_email}")
+        try:
+            pending_reviews = get_reviews(review_database_path, status="Pending")
+        except sqlite3.Error as exc:
+            st.error(f"Could not load pending reviews: {exc}")
+        else:
+            if not pending_reviews:
+                st.info("There are no reviews awaiting approval.")
+            for pending_review in pending_reviews:
+                review_id = str(pending_review["review_id"])
+                _render_student_review(pending_review)
+                has_sheet_fields = all(
+                    pending_review.get(field) is not None
+                    for field in (
+                        "difficulty_rating",
+                        "usefulness_rating",
+                        "liked",
+                        "assignments",
+                    )
+                )
+                has_sheet_fields = has_sheet_fields and bool(
+                    str(pending_review.get("assignments", "")).strip()
+                )
+                if pending_review.get("course", "").casefold() == "other":
+                    has_sheet_fields = has_sheet_fields and bool(
+                        str(pending_review.get("course_name", "")).strip()
+                    )
+                if not has_sheet_fields:
+                    st.warning(
+                        "This review is missing a course name or assignments information "
+                        "required by the Google Sheet. Ask the reviewer to submit it again."
+                    )
+                approve_col, reject_col = st.columns(2)
+                try:
+                    if has_sheet_fields:
+                        with approve_col:
+                            if st.button(
+                                "Approve",
+                                key=f"approve_{review_id}",
+                                type="primary",
+                            ):
+                                try:
+                                    _append_approved_review_to_source_sheet(pending_review)
+                                except (
+                                    ValueError,
+                                    gspread.exceptions.GSpreadException,
+                                    GoogleAuthError,
+                                    RequestException,
+                                    OSError,
+                                ) as exc:
+                                    st.error(
+                                        "Could not append this review to the Google Sheet. "
+                                        f"It remains pending: {exc}"
+                                    )
+                                else:
+                                    set_review_status(
+                                        review_database_path,
+                                        review_id,
+                                        "Approved",
+                                    )
+                                    load_data.clear()
+                                    st.rerun()
+                    with reject_col:
+                        if st.button("Reject", key=f"reject_{review_id}"):
+                            set_review_status(review_database_path, review_id, "Rejected")
+                            st.rerun()
+                except (ValueError, sqlite3.Error, gspread.exceptions.GSpreadException) as exc:
+                    st.error(f"Could not update review status: {exc}")
 
 
 # ---------- OVERVIEW ----------
