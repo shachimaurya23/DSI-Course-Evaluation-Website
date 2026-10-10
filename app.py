@@ -4,12 +4,10 @@ import numpy as np
 import gspread
 from google.auth.exceptions import GoogleAuthError
 from google.oauth2.service_account import Credentials
-import plotly.express as px
 import plotly.graph_objects as go
 from requests.exceptions import RequestException
 from collections import Counter
 import re
-import hashlib
 import logging
 import sqlite3
 import uuid
@@ -26,7 +24,7 @@ from review_workflow import (
 )
 
 st.set_page_config(
-    page_title="DSI Course Decision Dashboard",
+    page_title="DSI Course Reviews",
     page_icon="🦁",
     layout="wide",
 )
@@ -65,9 +63,9 @@ def _require_columbia_login() -> None:
     if not st.user.is_logged_in:
         st.markdown(
             "<div style='max-width:520px; margin:60px auto; text-align:center;'>"
-            "<h1 style='color:#012169;'>🦁 DSI Course Decision Dashboard</h1>"
+            "<h1 style='color:#012169;'>🦁 DSI Course Reviews</h1>"
             "<p style='color:#444; font-size:1.05rem;'>"
-            "This dashboard is restricted to Columbia University students. "
+            "These course reviews are restricted to Columbia University students. "
             "Sign in with your Columbia Google account to continue."
             "</p></div>",
             unsafe_allow_html=True,
@@ -186,21 +184,12 @@ def classify_course_type(course_value: str) -> str:
 
 # ---- Visual palette ----
 TYPE_COLORS = {"Core": "#012169", "Elective": "#75AADB"}          # Columbia blue + lighter
-TERM_COLORS = {"Fall": "#C75B12", "Spring": "#2E8B57",
-               "Summer": "#E0A800", "Winter": "#4A6FA5"}
 
 def type_badge(course_type: str) -> str:
     color = TYPE_COLORS.get(course_type, "#888")
     return (
         f"<span style='background:{color}; color:#fff; padding:2px 10px; "
         f"border-radius:10px; font-size:0.8rem; font-weight:600;'>{course_type}</span>"
-    )
-
-def term_badge(term: str) -> str:
-    color = TERM_COLORS.get(term, "#888")
-    return (
-        f"<span style='background:{color}; color:#fff; padding:2px 8px; "
-        f"border-radius:8px; font-size:0.75rem; font-weight:600;'>{term}</span>"
     )
 
 def component_chip(label: str, pct: int | None = None) -> str:
@@ -577,47 +566,6 @@ def donut_yesno(title: str, yes_pct):
         showlegend=False,
         height=250,
         margin=dict(l=10, r=10, t=45, b=10),
-    )
-    return fig
-
-
-def rating_strip(values: pd.Series, title: str, color: str = "#1f77b4"):
-    s = pd.to_numeric(values, errors="coerce").dropna()
-    fig = go.Figure()
-
-    if s.empty:
-        fig.add_annotation(text="No data", xref="paper", yref="paper",
-                           x=0.5, y=0.5, showarrow=False, font=dict(color="gray"))
-    else:
-        rng = np.random.default_rng(42)
-        jitter = rng.uniform(-0.15, 0.15, size=len(s))
-        fig.add_trace(go.Scatter(
-            x=s, y=jitter,
-            mode="markers",
-            marker=dict(size=14, color=color, opacity=0.65,
-                        line=dict(color="white", width=1.5)),
-            hovertemplate="Rating: %{x}<extra></extra>",
-            showlegend=False,
-        ))
-        mean_val = s.mean()
-        median_val = s.median()
-        fig.add_vline(x=mean_val, line_dash="dash", line_color="gray",
-                      annotation_text=f"avg {mean_val:.1f}",
-                      annotation_position="top")
-        # Median line below — robust to outliers
-        fig.add_vline(x=median_val, line_dash="dot", line_color="#2c3e50",
-                      annotation_text=f"med {median_val:.0f}",
-                      annotation_position="bottom")
-
-    fig.update_layout(
-        title={"text": title, "x": 0.0, "font": {"size": 14}},
-        xaxis=dict(range=[0.5, 10.5], tickmode="linear", tick0=1, dtick=1,
-                   title=None, zeroline=False),
-        yaxis=dict(range=[-0.5, 0.5], showticklabels=False, zeroline=False,
-                   showgrid=False, title=None),
-        height=140,
-        margin=dict(l=10, r=10, t=35, b=30),
-        plot_bgcolor="rgba(0,0,0,0)",
     )
     return fig
 
@@ -1045,40 +993,6 @@ def generate_review_summaries(course: str, comments_tuple: tuple,
     return result
 
 
-def mark_breakdown(assign_text: pd.Series) -> str:
-    if assign_text is None or assign_text.dropna().empty:
-        return "Not provided"
-
-    combined = " | ".join(assign_text.dropna().astype(str).tolist()).lower()
-    keywords = {
-        "midterm": ["midterm", "mid-term"],
-        "final": ["final exam", "final"],
-        "project": ["project", "capstone"],
-        "assignment": ["assignment", "homework", "hw"],
-        "problem set": ["problem set", "pset", "psets"],
-        "quiz": ["quiz", "quizzes"],
-        "reading": ["reading", "readings", "paper", "papers"],
-        "presentation": ["presentation", "presentations"],
-    }
-
-    counts = Counter()
-    for k, pats in keywords.items():
-        for p in pats:
-            counts[k] += len(re.findall(rf"\b{re.escape(p)}\b", combined))
-
-    if sum(counts.values()) == 0:
-        raw = " / ".join(assign_text.dropna().astype(str).unique().tolist())
-        return raw[:220] + ("..." if len(raw) > 220 else "")
-
-    parts = []
-    for k, c in counts.most_common():
-        if c <= 0:
-            continue
-        label = k + ("s" if c != 1 and not k.endswith("s") else "")
-        parts.append(f"{c} {label}")
-    return ", ".join(parts)
-
-
 def _render_review_cards(df_slice: pd.DataFrame):
     if df_slice.empty:
         st.caption("_No reviews in this group._")
@@ -1089,17 +1003,19 @@ def _render_review_cards(df_slice: pd.DataFrame):
 
     for _, row in df_slice.iterrows():
         sem = row.get(SEM_COL, "") or "—"
-        ts = row.get(TS_COL, "") or ""
+        prof = row.get(PROF_COL, "") or ""
+        if not isinstance(prof, str) or not prof.strip():
+            prof = "—"
+        else:
+            prof = prof.strip()
         diff = row.get(DIFF_COL, None)
         use = row.get(USE_COL, None)
         liked = row.get(LIKED_COL, None)
         comment = row.get(COMMENTS_COL, "") or ""
-        term = row.get("_term", None)
 
         liked_str = "👍 Yes" if liked is True else ("👎 No" if liked is False else "—")
         diff_str = "—" if pd.isna(diff) else f"{diff:.0f}/10"
         use_str = "—" if pd.isna(use) else f"{use:.0f}/10"
-        term_html = term_badge(term) + " " if isinstance(term, str) and term else ""
 
         # Possible misclick: liked=No but usefulness very high (or vice versa) AND no comment
         inconsistent = False
@@ -1114,9 +1030,10 @@ def _render_review_cards(df_slice: pd.DataFrame):
         )
 
         with st.container(border=True):
-            h1, h2, h3, h4 = st.columns([2.5, 1.3, 1.3, 1.3])
+            h1, h2, h3, h4 = st.columns([2.8, 1.2, 1.3, 1.3])
             h1.markdown(
-                f"{term_html}<span style='color:#555;'>{sem} · {ts}</span>{flag_html}",
+                f"<span style='font-weight:600;'>{prof}</span>"
+                f" · <span style='color:#555;'>{sem}</span>{flag_html}",
                 unsafe_allow_html=True,
             )
             h2.markdown(f"**Useful:** {use_str}")
@@ -1221,7 +1138,7 @@ if component_filter and "_components" in filtered.columns and COURSE_COL in filt
     filtered = filtered[filtered[COURSE_COL].isin(courses_with_all)]
 
 # ========== MAIN ==========
-st.title("Course Decision Dashboard")
+st.title("Course Reviews")
 st.caption("Built from student responses (auto-refreshes). Use filters in the sidebar.")
 
 configured_admins = st.secrets.get("review_admin_emails", [])
@@ -1265,8 +1182,8 @@ review_database_path = st.secrets.get(
 )
 
 tab_labels = [
-    "📊 Overview (Rankings)",
-    "🔍 Course Deep Dive",
+    "📊 Overview",
+    "🔍 Reviews",
     "⚖️ Compare Courses",
     "📝 Submit Review",
     "⭐ Student Reviews",
@@ -1507,24 +1424,7 @@ with tab_overview:
     if summary.empty:
         st.info("No courses match your current filters.")
     else:
-        # Derived only for the bubble chart layout below — not shown in the table
-        summary["ease"] = 10.0 - summary["avg_diff"]
-
-        st.subheader("Course rankings")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            total_courses = summary["Course"].nunique()
-            core_courses = int((summary["Type"] == "Core").sum()) if "Type" in summary.columns else 0
-            elective_courses = int((summary["Type"] == "Elective").sum()) if "Type" in summary.columns else 0
-            st.metric("Courses", total_courses, help=f"Core: {core_courses} | Elective: {elective_courses}")
-        with c2:
-            st.metric("Total reviews", int(summary["n"].sum()))
-        with c3:
-            st.metric("Avg usefulness (all)", f"{summary['avg_use'].mean():.2f}" if summary["avg_use"].notna().any() else "—")
-        with c4:
-            st.metric("Avg difficulty (all)", f"{summary['avg_diff'].mean():.2f}" if summary["avg_diff"].notna().any() else "—")
-
-        st.write(f"Minimum reviews: **{min_reviews}**.")
+        st.subheader("Courses")
 
         # Sort by # reviews descending — most-reviewed (highest signal) first
         show = summary.sort_values("n", ascending=False).copy()
@@ -1628,58 +1528,6 @@ with tab_overview:
             "**`5.0 ↓ 3`** means most rated it 3 but a few high ratings pulled the average up."
         )
 
-        # ---- Bubble chart (replaces the bar plot) ----
-        st.subheader("Where each course sits")
-        st.caption(
-            "Each circle is a course. **Right** = more useful. **Up** = easier. "
-            "**Bigger circle** = more reviews. **Greener** = more students liked it."
-        )
-        bubble_df = summary.dropna(subset=["avg_use", "avg_diff"]).copy()
-        if bubble_df.empty:
-            st.info("Not enough data to draw the chart.")
-        else:
-            fig = px.scatter(
-                bubble_df,
-                x="avg_use",
-                y="ease",
-                size="n",
-                color="liked_pct",
-                color_continuous_scale="RdYlGn",
-                range_color=[0, 100],
-                hover_name="Course",
-                hover_data={
-                    "avg_use": ":.2f",
-                    "ease": ":.2f",
-                    "avg_diff": ":.2f",
-                    "liked_pct": ":.0f",
-                    "n": True,
-                    "Type": True,
-                },
-                size_max=55,
-                text="Course",
-                labels={
-                    "avg_use": "Usefulness (1–10)",
-                    "ease": "Ease (10 − difficulty)",
-                    "liked_pct": "Liked %",
-                    "n": "# reviews",
-                },
-            )
-            fig.update_traces(
-                textposition="top center",
-                textfont=dict(size=10),
-                marker=dict(line=dict(width=1, color="white"), opacity=0.85),
-            )
-            fig.update_layout(
-                height=600,
-                margin=dict(l=20, r=20, t=30, b=20),
-                xaxis=dict(range=[0, 10.5], dtick=1),
-                yaxis=dict(range=[0, 10.5], dtick=1),
-            )
-            # Add faint "best quadrant" guide line (top-right = useful AND easy)
-            fig.add_hline(y=5, line_dash="dot", line_color="lightgray", opacity=0.5)
-            fig.add_vline(x=5, line_dash="dot", line_color="lightgray", opacity=0.5)
-            st.plotly_chart(fig, use_container_width=True)
-
 
 # ---------- COURSE DEEP DIVE ----------
 with tab_deep:
@@ -1725,7 +1573,7 @@ with tab_deep:
         if n <= 2:
             st.warning(
                 f"⚠️ **Only {n} review{'s' if n != 1 else ''}** — a single misclick can swing these "
-                f"numbers a lot. Use median (below mean) as a sanity check, and read the comments."
+                f"numbers a lot. Read the comments."
             )
         elif n < 5:
             st.info(f"Only {n} reviews — interpret averages cautiously.")
@@ -1746,22 +1594,6 @@ with tab_deep:
         with k4:
             st.metric("Liked", "—" if liked_pct is None else f"{liked_pct:.0f}%")
 
-        st.subheader("Where every review falls")
-        st.caption("Each dot is one student's rating. Dashed line is the average.")
-        sp1, sp2 = st.columns(2)
-        with sp1:
-            if USE_COL in f.columns:
-                st.plotly_chart(
-                    rating_strip(f[USE_COL], "Usefulness (1–10)", color="#2e86de"),
-                    use_container_width=True
-                )
-        with sp2:
-            if DIFF_COL in f.columns:
-                st.plotly_chart(
-                    rating_strip(f[DIFF_COL], "Difficulty (1–10)", color="#e67e22"),
-                    use_container_width=True
-                )
-
         # Course component chips (% of reviewers who mentioned each)
         st.markdown("**Course components**")
         if "_components" in f.columns and len(f) > 0:
@@ -1778,42 +1610,11 @@ with tab_deep:
                 st.markdown(f"<div>{chips_html}</div>", unsafe_allow_html=True)
             else:
                 st.caption("_Not provided._")
-        st.caption(
-            "Raw: " + mark_breakdown(f.get(ASSIGN_COL, pd.Series(dtype=str)))
-        )
 
         st.divider()
 
         # ---- REVIEWS SECTION ----
         st.subheader(f"Reviews ({n})")
-
-        # ---- Pinned: most helpful review ----
-        _tip_re = re.compile("|".join(TIP_PATTERNS), re.IGNORECASE)
-        candidates = f.copy()
-        if COMMENTS_COL in candidates.columns:
-            candidates["_comment_str"] = candidates[COMMENTS_COL].fillna("").astype(str)
-            candidates["_has_tip"] = candidates["_comment_str"].apply(lambda c: bool(_tip_re.search(c)))
-            candidates["_clen"] = candidates["_comment_str"].str.len()
-            with_tip = candidates[candidates["_has_tip"] & (candidates["_clen"] > 80)]
-            pool = with_tip if not with_tip.empty else candidates[candidates["_clen"] > 120]
-            if not pool.empty:
-                top = pool.sort_values("_clen", ascending=False).iloc[0]
-                top_comment = top["_comment_str"]
-                top_prof = top.get(PROF_COL, "") or "—"
-                top_sem = top.get(SEM_COL, "") or "—"
-                top_use = top.get(USE_COL, None)
-                top_diff = top.get(DIFF_COL, None)
-                use_s = "—" if pd.isna(top_use) else f"{top_use:.0f}/10"
-                diff_s = "—" if pd.isna(top_diff) else f"{top_diff:.0f}/10"
-                with st.container(border=True):
-                    st.markdown(
-                        "<span style='background:#27ae60; color:#fff; padding:2px 10px; "
-                        "border-radius:10px; font-size:0.75rem; font-weight:600;'>⭐ Most helpful review</span> "
-                        f"<span style='color:#666; font-size:0.85rem;'>· Prof. {top_prof} · {top_sem} · "
-                        f"Useful {use_s} · Difficulty {diff_s}</span>",
-                        unsafe_allow_html=True,
-                    )
-                    st.write(top_comment)
 
         with st.container(border=True):
             st.markdown("**Filter reviews**")
@@ -1848,164 +1649,51 @@ with tab_deep:
         if filtered_n != n:
             st.caption(f"Showing **{filtered_n}** of {n} reviews based on filters.")
 
-        # ---- Summary ----
-        comments_series = rf.get(COMMENTS_COL, pd.Series(dtype=str)).dropna().astype(str)
-        comments_series = comments_series[comments_series.str.strip() != ""]
-
-        # Always render the template summary, even with 0 comments
-        rf_use = pd.to_numeric(rf.get(USE_COL, pd.Series(dtype=float)), errors="coerce").dropna()
-        rf_diff = pd.to_numeric(rf.get(DIFF_COL, pd.Series(dtype=float)), errors="coerce").dropna()
-        rf_liked = rf.get(LIKED_COL, pd.Series(dtype=bool)).dropna()
-        stats_for_summary = {
-            "n": len(rf),
-            "avg_use": float(rf_use.mean()) if not rf_use.empty else None,
-            "avg_diff": float(rf_diff.mean()) if not rf_diff.empty else None,
-            "liked_pct": float(100.0 * rf_liked.mean()) if not rf_liked.empty else None,
-            "sentiment": _sentiment_score(comments_series),
-            "style": _style,
-        }
-
-        comments_list = comments_series.tolist()
-
-        with st.spinner("Generating summary..."):
-            summaries = generate_review_summaries(
-                course,
-                tuple(comments_list),
-                tuple(stats_for_summary.items()),
-            )
-
-        # ---- Render: template always; AI on top if available ----
-        with st.container(border=True):
-            st.markdown("### 📝 Summary of student reviews")
-            if summaries.get("ai"):
-                st.write(summaries["ai"])
-                st.caption(summaries["template"])
-            else:
-                st.write(summaries["template"])
-                if not st.secrets.get("HF_API_TOKEN"):
-                    st.caption("_Add HF_API_TOKEN to Streamlit secrets for AI-written summaries._")
-                elif comments_list:
-                    st.caption("_AI summary unavailable — based on the structured ratings above._")
-
-        # ---- Per-bucket: AI paragraph OR labeled quotes ----
-        has_breakdown = any([summaries.get("positive"),
-                             summaries.get("negative"),
-                             summaries.get("tips")])
-        if has_breakdown:
-            s1, s2, s3 = st.columns(3)
-
-            def _render_bucket(col, header, key):
-                with col:
-                    st.markdown(header)
-                    val = summaries.get(key)
-                    is_quotes = summaries.get(f"{key}_is_quotes", False)
-                    if not val:
-                        empty_msg = {
-                            "positive": "_Nothing clearly positive flagged._",
-                            "negative": "_Nothing clearly negative flagged._",
-                            "tips":     "_No explicit tips found._",
-                        }[key]
-                        st.caption(empty_msg)
-                        return
-                    if is_quotes:
-                        st.caption("_Direct quotes from reviewers:_")
-                        for q in val:
-                            q_short = q.strip()
-                            if len(q_short) > 240:
-                                q_short = q_short[:240].rstrip() + "…"
-                            st.markdown(f"> {q_short}")
-                    else:
-                        st.write(val)
-
-            _render_bucket(s1, "#### 👍 What students loved", "positive")
-            _render_bucket(s2, "#### 👎 Common complaints", "negative")
-            _render_bucket(s3, "#### 💡 Tips for success", "tips")
-
-        # Keep AI service diagnostics in server logs.
-        for error in summaries.get("errors", []):
-            logging.getLogger(__name__).warning("AI summary service error: %s", error)
-
-        st.divider()
-
-        # ---- REVIEW CARDS GROUPED BY PROFESSOR ----
         if filtered_n == 0:
             st.info("No reviews match your filters.")
         else:
-            rf = rf.copy()
-            # Use the canonical key (fuzzy-merged) so "Drinea" and "Drea" collapse
-            rf["_prof_group"] = rf.get("_prof_canon", rf[PROF_COL].apply(_prof_normalize_key))
-            rf["_prof_group"] = rf["_prof_group"].replace("", "— unknown —")
+            _render_review_cards(rf)
 
-            display_map = {}
-            for key, grp in rf.groupby("_prof_group"):
-                if key == "— unknown —":
-                    display_map[key] = "— Unknown —"
-                else:
-                    names = grp[PROF_COL].dropna().astype(str).str.strip()
-                    names = names[names != ""]
-                    if len(names) > 0:
-                        display_map[key] = names.value_counts().idxmax()
-                    else:
-                        display_map[key] = "— Unknown —"
+            # Summary follows the same filters, and renders after the reviews.
+            comments_series = rf.get(COMMENTS_COL, pd.Series(dtype=str)).dropna().astype(str)
+            comments_series = comments_series[comments_series.str.strip() != ""]
 
-            prof_order_keys = (
-                rf.groupby("_prof_group").size()
-                  .sort_values(ascending=False)
-                  .index.tolist()
-            )
+            rf_use = pd.to_numeric(rf.get(USE_COL, pd.Series(dtype=float)), errors="coerce").dropna()
+            rf_diff = pd.to_numeric(rf.get(DIFF_COL, pd.Series(dtype=float)), errors="coerce").dropna()
+            rf_liked = rf.get(LIKED_COL, pd.Series(dtype=bool)).dropna()
+            stats_for_summary = {
+                "n": len(rf),
+                "avg_use": float(rf_use.mean()) if not rf_use.empty else None,
+                "avg_diff": float(rf_diff.mean()) if not rf_diff.empty else None,
+                "liked_pct": float(100.0 * rf_liked.mean()) if not rf_liked.empty else None,
+                "sentiment": _sentiment_score(comments_series),
+                "style": _style,
+            }
 
-            # Color-code each prof tab with a deterministic CSS background.
-            # Same prof key -> same color across courses (md5(key) % palette).
-            PROF_BG_PALETTE = [
-                ("#fee2e2", "#fca5a5", "#dc2626"),  # red
-                ("#fef3c7", "#fde68a", "#d97706"),  # amber
-                ("#dcfce7", "#86efac", "#16a34a"),  # green
-                ("#dbeafe", "#93c5fd", "#2563eb"),  # blue
-                ("#fae8ff", "#e9d5ff", "#9333ea"),  # purple
-                ("#fce7f3", "#f9a8d4", "#db2777"),  # pink
-                ("#e0e7ff", "#a5b4fc", "#4f46e5"),  # indigo
-                ("#fed7aa", "#fdba74", "#ea580c"),  # orange
-                ("#ccfbf1", "#5eead4", "#0d9488"),  # teal
-            ]
-            UNKNOWN_BG = ("#f3f4f6", "#d1d5db", "#6b7280")  # gray for "— unknown —"
+            comments_list = comments_series.tolist()
 
-            def _prof_palette(key: str):
-                if key == "— unknown —":
-                    return UNKNOWN_BG
-                idx = int(hashlib.md5(key.encode("utf-8")).hexdigest(), 16) % len(PROF_BG_PALETTE)
-                return PROF_BG_PALETTE[idx]
-
-            tab_labels = [
-                f"{display_map[k]} ({rf[rf['_prof_group'] == k].shape[0]})"
-                for k in prof_order_keys
-            ]
-
-            # Inject CSS targeting nested tab-lists (the ones inside Streamlit
-            # tab-panels — i.e. the prof tabs inside this Deep Dive panel).
-            # nth-of-type indexes are 1-based and follow the order we pass to st.tabs.
-            css_rules = []
-            for i, key in enumerate(prof_order_keys, start=1):
-                soft, active, border = _prof_palette(key)
-                css_rules.append(
-                    f"""
-                    [data-baseweb="tab-panel"] [data-baseweb="tab-list"] > button[data-baseweb="tab"]:nth-of-type({i}) {{
-                        background-color: {soft} !important;
-                    }}
-                    [data-baseweb="tab-panel"] [data-baseweb="tab-list"] > button[data-baseweb="tab"]:nth-of-type({i})[aria-selected="true"] {{
-                        background-color: {active} !important;
-                        border-bottom-color: {border} !important;
-                    }}
-                    """
+            st.divider()
+            with st.spinner("Generating summary..."):
+                summaries = generate_review_summaries(
+                    course,
+                    tuple(comments_list),
+                    tuple(stats_for_summary.items()),
                 )
-            st.markdown(
-                "<style>" + "".join(css_rules) + "</style>",
-                unsafe_allow_html=True,
-            )
 
-            prof_tabs = st.tabs(tab_labels)
-            for prof_tab, key in zip(prof_tabs, prof_order_keys):
-                with prof_tab:
-                    _render_review_cards(rf[rf["_prof_group"] == key])
+            with st.container(border=True):
+                st.markdown("### 📝 Summary of student reviews")
+                if summaries.get("ai"):
+                    st.write(summaries["ai"])
+                    st.caption(summaries["template"])
+                else:
+                    st.write(summaries["template"])
+                    if not st.secrets.get("HF_API_TOKEN"):
+                        st.caption("_Add HF_API_TOKEN to Streamlit secrets for AI-written summaries._")
+                    elif comments_list:
+                        st.caption("_AI summary unavailable — based on the structured ratings above._")
+
+            for error in summaries.get("errors", []):
+                logging.getLogger(__name__).warning("AI summary service error: %s", error)
 
 
 # ---------- COMPARE COURSES ----------
@@ -2073,35 +1761,6 @@ with tab_compare:
                             _mini_bar_html("Liked",      row["liked_pct"], "%",  "#27AE60", max_val=100.0)
                         )
                         st.markdown(bars_html, unsafe_allow_html=True)
-
-            st.divider()
-
-            # ---- Radar / spider chart (the circle layers one) ----
-            st.markdown("#### 🕸️ Overall shape comparison")
-            st.caption("Each course is a colored shape. Further from the center = better. Overlap shows similarities.")
-
-            radar_df = summary.copy()
-            radar_df["liked_10"] = radar_df["liked_pct"] / 10.0
-            radar_df["ease"] = 10.0 - radar_df["avg_diff"]
-            cat_names = ["Usefulness", "Liked", "Ease (10-difficulty)"]
-
-            radar_fig = go.Figure()
-            for _, r in radar_df.iterrows():
-                vals = [r["avg_use"], r["liked_10"], r["ease"]]
-                radar_fig.add_trace(go.Scatterpolar(
-                    r=vals + [vals[0]],
-                    theta=cat_names + [cat_names[0]],
-                    fill="toself",
-                    name=r["Course"],
-                ))
-
-            radar_fig.update_layout(
-                polar=dict(radialaxis=dict(visible=True, range=[0, 10])),
-                showlegend=True,
-                height=500,
-                margin=dict(l=20, r=20, t=30, b=20),
-            )
-            st.plotly_chart(radar_fig, use_container_width=True)
 
             st.divider()
 
